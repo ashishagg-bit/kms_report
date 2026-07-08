@@ -164,10 +164,25 @@ async function upsertResults(
   }
 
   if (rows.length > 0) {
-    const { error } = await admin
+    const { data: upserted, error } = await admin
       .from("campaign_posts")
-      .upsert(rows, { onConflict: "campaign_id,post_url" });
+      .upsert(rows, { onConflict: "campaign_id,post_url" })
+      .select("id, views, likes, comments_count, shares");
     if (error) throw error;
+
+    if (upserted && upserted.length > 0) {
+      const snapshots = upserted.map((p) => ({
+        campaign_post_id: p.id,
+        views: p.views,
+        likes: p.likes,
+        comments_count: p.comments_count,
+        shares: p.shares,
+      }));
+      const { error: snapshotErr } = await admin.from("campaign_post_snapshots").insert(snapshots);
+      // Snapshot history is a nice-to-have for trend charts -- don't fail
+      // the whole refresh over it, just log if it breaks.
+      if (snapshotErr) console.error("failed to insert campaign_post_snapshots", snapshotErr);
+    }
   }
 
   return { succeeded: rows.length, failed };
