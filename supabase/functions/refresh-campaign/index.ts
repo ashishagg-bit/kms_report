@@ -1,12 +1,12 @@
 // refresh-campaign: pulls stored post_urls for a campaign, re-scrapes them
 // via Apify's Instagram Post Scraper, and upserts the results.
 //
-// NOTE ON APIFY SCHEMA: field names below (likesCount, videoViewCount,
-// latestComments, etc.) reflect apify/instagram-post-scraper's documented
-// output as of this actor's stable version. Apify actor schemas evolve;
-// before relying on this in production, run one campaign through and
-// diff a raw_json row against the field names read in extractPostFields()
-// below, adjusting the candidate key lists if the actor has changed.
+// NOTE ON APIFY SCHEMA: verified live against a real scrape (2026-07-08).
+// Output field names (likesCount, commentsCount, videoViewCount,
+// videoPlayCount, ownerUsername, displayUrl, timestamp, latestComments)
+// are confirmed correct. The one surprise: the actor's *input* field for
+// URLs to scrape is called "username" despite accepting full post/reel
+// URLs directly -- see runApifyScraper() below.
 //
 // IMPORTANT: "views" is Instagram's public view-count metric available on
 // scraped posts/reels. It is NOT Meta's Reach metric -- Reach is only
@@ -16,7 +16,6 @@
 import { corsHeaders, jsonResponse } from "../_shared/http.ts";
 import { adminClient, requireAdmin } from "../_shared/authorizeAdmin.ts";
 
-const APIFY_TOKEN = Deno.env.get("APIFY_TOKEN")!;
 const ACTOR_ID = "apify~instagram-post-scraper";
 
 interface FailedPost {
@@ -68,7 +67,12 @@ Deno.serve(async (req) => {
       });
     }
 
-    const items = await runApifyScraper(postUrls);
+    const { data: apifyToken, error: tokenErr } = await admin.rpc("get_apify_token");
+    if (tokenErr || !apifyToken) {
+      throw new Error("apify_token not found in Vault (see migration 20260708000007_apify_token_vault.sql)");
+    }
+
+    const items = await runApifyScraper(postUrls, apifyToken as string);
     const { succeeded, failed } = await upsertResults(admin, campaignId, postUrls, items);
 
     await admin
@@ -98,14 +102,16 @@ Deno.serve(async (req) => {
   }
 });
 
-async function runApifyScraper(directUrls: string[]): Promise<Record<string, unknown>[]> {
+async function runApifyScraper(directUrls: string[], apifyToken: string): Promise<Record<string, unknown>[]> {
   const res = await fetch(
-    `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`,
+    `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?token=${apifyToken}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        directUrls,
+        // Despite the name, this actor's "username" field accepts direct
+        // post/reel URLs, not just handles -- verified against a live run.
+        username: directUrls,
         resultsType: "details",
         addParentData: false,
       }),
@@ -131,7 +137,10 @@ async function upsertResults(
   const failed: FailedPost[] = [];
 
   for (const item of items) {
-    const url = firstString(item, ["url", "inputUrl", "postUrl"]);
+    // inputUrl is exactly what we sent (matches our stored post_url for the
+    // upsert conflict target); Apify's "url" is normalized/canonicalized
+    // and won't match a stored URL that has query params or a /reel/ path.
+    const url = firstString(item, ["inputUrl", "url", "postUrl"]);
     if (!url) continue;
 
     if (item.error) {
