@@ -22,6 +22,14 @@ export async function requireAdmin(
   const jwt = authHeader.replace(/^Bearer\s+/i, "");
   if (!jwt) return jsonResponse({ error: "unauthorized" }, 401);
 
+  // Internal calls (the pg_cron scheduled refresh) authenticate with the
+  // project's own service role key, known only to this function's runtime
+  // env and to the database's app.settings.service_role_key GUC -- never
+  // exposed to any browser client. Bypasses the human admin/profile lookup.
+  if (jwt === SERVICE_ROLE_KEY) {
+    return { userId: "service_role" };
+  }
+
   const callerClient = createClient(SUPABASE_URL, ANON_KEY, {
     global: { headers: { Authorization: `Bearer ${jwt}` } },
   });
