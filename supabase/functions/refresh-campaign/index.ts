@@ -212,6 +212,9 @@ function extractPostFields(item: Record<string, unknown>) {
     comments_count: firstNumber(item, ["commentsCount", "comments"]),
     shares: firstNumber(item, ["sharesCount", "shares"]),
     thumbnail_url: firstString(item, ["displayUrl", "thumbnailUrl", "imageUrl"]),
+    // Only present for video/reel posts -- lets the frontend play the real
+    // video natively instead of needing Instagram's oEmbed/embed.js.
+    video_url: firstString(item, ["videoUrl"]),
     creator_username: firstString(item, ["ownerUsername", "username"]),
     top_comments: topComments,
   };
