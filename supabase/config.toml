@@ -29,11 +29,5 @@ policy = "oneshot"
 [functions.refresh-campaign]
 verify_jwt = true
 
-[functions.create-campaign]
-verify_jwt = true
-
-[functions.add-posts-to-campaign]
-verify_jwt = true
-
 [functions.invite-client]
 verify_jwt = true
