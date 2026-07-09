@@ -204,13 +204,20 @@ function extractPostFields(item: Record<string, unknown>) {
     .sort((a, b) => b.likes - a.likes)
     .slice(0, 5);
 
+  // NOTE: "shares" is deliberately NOT set here. Verified live against two
+  // different Apify Instagram actors (including on video/reel posts): the
+  // field never appears in the scraped data, because Instagram never sends
+  // a share count to anyone but the post's own owner, for any post type.
+  // campaign_posts.shares is therefore admin-entered only (a creator's
+  // self-reported number from their own Insights) -- omitting the key here
+  // entirely (rather than setting it to null) means this upsert never
+  // touches/clobbers a manually-entered value on refresh.
   return {
     posted_at: postedAtRaw ? new Date(postedAtRaw).toISOString() : null,
     // "views" -- public scrape metric, not Meta Reach. See file header note.
     views: firstNumber(item, ["videoViewCount", "videoPlayCount", "viewCount", "views"]),
     likes: firstNumber(item, ["likesCount", "likes"]),
     comments_count: firstNumber(item, ["commentsCount", "comments"]),
-    shares: firstNumber(item, ["sharesCount", "shares"]),
     thumbnail_url: firstString(item, ["displayUrl", "thumbnailUrl", "imageUrl"]),
     // Only present for video/reel posts -- lets the frontend play the real
     // video natively instead of needing Instagram's oEmbed/embed.js.
