@@ -1,27 +1,23 @@
-// refresh-campaign: pulls stored post_urls for a campaign, re-scrapes them
-// via Apify's Instagram Post Scraper, and upserts the results.
+// refresh-campaign: kicks off an async Apify scrape of a campaign's posts
+// and returns immediately. Results are processed later by apify-webhook
+// when Apify calls back -- this avoids Edge Function execution timeouts on
+// large batches (200-500 posts can take many minutes of real browser-based
+// scraping, far longer than a synchronous request should ever block for).
 //
-// NOTE ON APIFY SCHEMA: verified live against a real scrape (2026-07-08).
-// Output field names (likesCount, commentsCount, videoViewCount,
-// videoPlayCount, ownerUsername, displayUrl, timestamp, latestComments)
-// are confirmed correct. The one surprise: the actor's *input* field for
-// URLs to scrape is called "username" despite accepting full post/reel
-// URLs directly -- see runApifyScraper() below.
-//
-// IMPORTANT: "views" is Instagram's public view-count metric available on
-// scraped posts/reels. It is NOT Meta's Reach metric -- Reach is only
-// available via the Insights API for accounts you own, which is out of
-// scope for public post scraping. Do not conflate the two.
+// A campaign can only have one refresh in flight at a time (campaigns.
+// refreshing_since acts as a lock) -- this is the backend-level fix for the
+// double-refresh/double-billing issue found earlier, independent of
+// whatever the frontend's "Refresh now" button does.
 
 import { corsHeaders, jsonResponse } from "../_shared/http.ts";
 import { adminClient, requireAdmin } from "../_shared/authorizeAdmin.ts";
 
 const ACTOR_ID = "apify~instagram-post-scraper";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 
-interface FailedPost {
-  url: string;
-  reason: string;
-}
+// A lock older than this is treated as stale (e.g. a run that crashed
+// before its webhook ever fired) so a campaign can't get stuck forever.
+const LOCK_STALE_MINUTES = 30;
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -42,57 +38,89 @@ Deno.serve(async (req) => {
       return jsonResponse({ error: "campaign_id is required" }, 400);
     }
 
-    const { data: campaign, error: campaignErr } = await admin
+    // Atomic compare-and-swap: acquire the lock in a single UPDATE...WHERE
+    // so two simultaneous requests can't both read "unlocked" before either
+    // writes (that race is exactly what let the earlier double-refresh bug
+    // happen). Postgres's row-level locking serializes concurrent UPDATEs
+    // on the same row -- the second one re-evaluates its WHERE clause
+    // against the first one's already-committed result and simply matches
+    // zero rows.
+    const staleThreshold = new Date(Date.now() - LOCK_STALE_MINUTES * 60 * 1000).toISOString();
+    const { data: lockedRows, error: lockErr } = await admin
       .from("campaigns")
-      .select("id")
+      .update({ refreshing_since: new Date().toISOString(), last_refresh_error: null })
       .eq("id", campaignId)
-      .single();
-    if (campaignErr || !campaign) {
-      return jsonResponse({ error: "campaign_not_found" }, 404);
-    }
+      .or(`refreshing_since.is.null,refreshing_since.lt.${staleThreshold}`)
+      .select("id");
+    if (lockErr) throw lockErr;
 
-    const { data: existingPosts, error: postsErr } = await admin
-      .from("campaign_posts")
-      .select("post_url")
-      .eq("campaign_id", campaignId);
-    if (postsErr) throw postsErr;
-
-    const postUrls = (existingPosts ?? []).map((p) => p.post_url as string);
-    if (postUrls.length === 0) {
-      return jsonResponse({
-        campaign_id: campaignId,
-        message: "no_posts_to_refresh",
-        succeeded: 0,
-        failed: [],
-      });
-    }
-
-    const { data: apifyToken, error: tokenErr } = await admin.rpc("get_apify_token");
-    if (tokenErr || !apifyToken) {
-      throw new Error("apify_token not found in Vault (see migration 20260708000007_apify_token_vault.sql)");
-    }
-
-    const items = await runApifyScraper(postUrls, apifyToken as string);
-    const { succeeded, failed } = await upsertResults(admin, campaignId, postUrls, items);
-
-    await admin
-      .from("campaigns")
-      .update({ last_refreshed_at: new Date().toISOString() })
-      .eq("id", campaignId);
-
-    if (failed.length > 0) {
-      console.warn(
-        `refresh-campaign: campaign ${campaignId} - ${failed.length}/${postUrls.length} posts failed`,
-        failed,
+    if (!lockedRows || lockedRows.length === 0) {
+      const { data: campaignCheck } = await admin
+        .from("campaigns")
+        .select("id, refreshing_since")
+        .eq("id", campaignId)
+        .maybeSingle();
+      if (!campaignCheck) {
+        return jsonResponse({ error: "campaign_not_found" }, 404);
+      }
+      return jsonResponse(
+        { error: "refresh_already_in_progress", refreshing_since: campaignCheck.refreshing_since },
+        409,
       );
     }
 
-    return jsonResponse({
-      campaign_id: campaignId,
-      requested: postUrls.length,
-      succeeded,
-      failed,
-    });
+    try {
+      const { data: existingPosts, error: postsErr } = await admin
+        .from("campaign_posts")
+        .select("post_url")
+        .eq("campaign_id", campaignId);
+      if (postsErr) throw postsErr;
+
+      const postUrls = (existingPosts ?? []).map((p) => p.post_url as string);
+      if (postUrls.length === 0) {
+        // Nothing to do -- release the lock we just took.
+        await admin.from("campaigns").update({ refreshing_since: null }).eq("id", campaignId);
+        return jsonResponse({
+          campaign_id: campaignId,
+          message: "no_posts_to_refresh",
+        });
+      }
+
+      const { data: apifyToken, error: tokenErr } = await admin.rpc("get_apify_token");
+      if (tokenErr || !apifyToken) {
+        throw new Error("apify_token not found in Vault (see migration 20260708000007_apify_token_vault.sql)");
+      }
+
+      const { data: webhookSecret, error: secretErr } = await admin.rpc("get_apify_webhook_secret");
+      if (secretErr || !webhookSecret) {
+        throw new Error("apify_webhook_secret not found in Vault (see migration 20260709000001_async_refresh.sql)");
+      }
+
+      const runId = await startApifyRun(
+        postUrls,
+        apifyToken as string,
+        webhookSecret as string,
+        campaignId,
+      );
+
+      return jsonResponse({
+        campaign_id: campaignId,
+        status: "started",
+        requested: postUrls.length,
+        run_id: runId,
+      });
+    } catch (err) {
+      // Starting the run failed after we'd already acquired the lock --
+      // release it so the campaign doesn't stay stuck for 30 minutes.
+      await admin
+        .from("campaigns")
+        .update({
+          refreshing_since: null,
+          last_refresh_error: err instanceof Error ? err.message : String(err),
+        })
+        .eq("id", campaignId);
+      throw err;
+    }
   } catch (err) {
     console.error("refresh-campaign error", err);
     return jsonResponse(
@@ -102,9 +130,35 @@ Deno.serve(async (req) => {
   }
 });
 
-async function runApifyScraper(directUrls: string[], apifyToken: string): Promise<Record<string, unknown>[]> {
+async function startApifyRun(
+  directUrls: string[],
+  apifyToken: string,
+  webhookSecret: string,
+  campaignId: string,
+): Promise<string | null> {
+  const webhookUrl =
+    `${SUPABASE_URL}/functions/v1/apify-webhook` +
+    `?secret=${encodeURIComponent(webhookSecret)}` +
+    `&campaign_id=${encodeURIComponent(campaignId)}`;
+
+  // Apify's ad-hoc per-run webhook mechanism: a base64-encoded JSON array
+  // passed as the `webhooks` query param on the "run actor" call, so we
+  // don't need to pre-configure anything in the Apify console. Verified
+  // live below (see startApifyRun's caller / the live test run after
+  // deploy) -- flagging in case Apify's exact mechanism has since changed.
+  const webhooksParam = encodeURIComponent(
+    btoa(
+      JSON.stringify([
+        {
+          eventTypes: ["ACTOR.RUN.SUCCEEDED", "ACTOR.RUN.FAILED", "ACTOR.RUN.TIMED_OUT", "ACTOR.RUN.ABORTED"],
+          requestUrl: webhookUrl,
+        },
+      ]),
+    ),
+  );
+
   const res = await fetch(
-    `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?token=${apifyToken}`,
+    `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${apifyToken}&webhooks=${webhooksParam}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -120,125 +174,9 @@ async function runApifyScraper(directUrls: string[], apifyToken: string): Promis
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Apify actor run failed: ${res.status} ${text}`);
+    throw new Error(`Failed to start Apify run: ${res.status} ${text}`);
   }
 
-  return (await res.json()) as Record<string, unknown>[];
-}
-
-async function upsertResults(
-  admin: ReturnType<typeof adminClient>,
-  campaignId: string,
-  requestedUrls: string[],
-  items: Record<string, unknown>[],
-): Promise<{ succeeded: number; failed: FailedPost[] }> {
-  const rows: Record<string, unknown>[] = [];
-  const matchedUrls = new Set<string>();
-  const failed: FailedPost[] = [];
-
-  for (const item of items) {
-    // inputUrl is exactly what we sent (matches our stored post_url for the
-    // upsert conflict target); Apify's "url" is normalized/canonicalized
-    // and won't match a stored URL that has query params or a /reel/ path.
-    const url = firstString(item, ["inputUrl", "url", "postUrl"]);
-    if (!url) continue;
-
-    if (item.error) {
-      failed.push({ url, reason: String(item.errorDescription ?? item.error) });
-      continue;
-    }
-
-    matchedUrls.add(url);
-    rows.push({
-      campaign_id: campaignId,
-      post_url: url,
-      ...extractPostFields(item),
-      raw_json: item,
-    });
-  }
-
-  for (const url of requestedUrls) {
-    if (!matchedUrls.has(url) && !failed.some((f) => f.url === url)) {
-      failed.push({ url, reason: "no_result_returned_by_apify" });
-    }
-  }
-
-  if (rows.length > 0) {
-    const { data: upserted, error } = await admin
-      .from("campaign_posts")
-      .upsert(rows, { onConflict: "campaign_id,post_url" })
-      .select("id, views, likes, comments_count, shares");
-    if (error) throw error;
-
-    if (upserted && upserted.length > 0) {
-      const snapshots = upserted.map((p) => ({
-        campaign_post_id: p.id,
-        views: p.views,
-        likes: p.likes,
-        comments_count: p.comments_count,
-        shares: p.shares,
-      }));
-      const { error: snapshotErr } = await admin.from("campaign_post_snapshots").insert(snapshots);
-      // Snapshot history is a nice-to-have for trend charts -- don't fail
-      // the whole refresh over it, just log if it breaks.
-      if (snapshotErr) console.error("failed to insert campaign_post_snapshots", snapshotErr);
-    }
-  }
-
-  return { succeeded: rows.length, failed };
-}
-
-function extractPostFields(item: Record<string, unknown>) {
-  const postedAtRaw = firstString(item, ["timestamp", "takenAt"]);
-  const rawComments = (item.latestComments ?? item.comments ?? item.topComments ?? []) as unknown[];
-
-  const topComments = rawComments
-    .map((c) => {
-      const comment = c as Record<string, unknown>;
-      return {
-        username: firstString(comment, ["ownerUsername", "username"]) ?? "unknown",
-        text: typeof comment.text === "string" ? comment.text : "",
-        likes: firstNumber(comment, ["likesCount", "likes"]) ?? 0,
-      };
-    })
-    .sort((a, b) => b.likes - a.likes)
-    .slice(0, 5);
-
-  // NOTE: "shares" is deliberately NOT set here. Verified live against two
-  // different Apify Instagram actors (including on video/reel posts): the
-  // field never appears in the scraped data, because Instagram never sends
-  // a share count to anyone but the post's own owner, for any post type.
-  // campaign_posts.shares is therefore admin-entered only (a creator's
-  // self-reported number from their own Insights) -- omitting the key here
-  // entirely (rather than setting it to null) means this upsert never
-  // touches/clobbers a manually-entered value on refresh.
-  return {
-    posted_at: postedAtRaw ? new Date(postedAtRaw).toISOString() : null,
-    // "views" -- public scrape metric, not Meta Reach. See file header note.
-    views: firstNumber(item, ["videoViewCount", "videoPlayCount", "viewCount", "views"]),
-    likes: firstNumber(item, ["likesCount", "likes"]),
-    comments_count: firstNumber(item, ["commentsCount", "comments"]),
-    thumbnail_url: firstString(item, ["displayUrl", "thumbnailUrl", "imageUrl"]),
-    // Only present for video/reel posts -- lets the frontend play the real
-    // video natively instead of needing Instagram's oEmbed/embed.js.
-    video_url: firstString(item, ["videoUrl"]),
-    creator_username: firstString(item, ["ownerUsername", "username"]),
-    top_comments: topComments,
-  };
-}
-
-function firstNumber(obj: Record<string, unknown>, keys: string[]): number | null {
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === "number") return value;
-  }
-  return null;
-}
-
-function firstString(obj: Record<string, unknown>, keys: string[]): string | null {
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return null;
+  const data = await res.json();
+  return data?.data?.id ?? null;
 }
