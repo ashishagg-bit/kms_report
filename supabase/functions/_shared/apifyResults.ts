@@ -87,6 +87,10 @@ export async function upsertApifyResults(
       post_url: url,
       ...extractPostFields(item),
       raw_json: item,
+      // Clear any previous failure now that this post scraped successfully
+      // -- covers the transient case (e.g. restricted_page) resolving on a
+      // later refresh.
+      last_scrape_error: null,
     });
   }
 
@@ -116,6 +120,17 @@ export async function upsertApifyResults(
       // the whole refresh over it, just log if it breaks.
       if (snapshotErr) console.error("failed to insert campaign_post_snapshots", snapshotErr);
     }
+  }
+
+  // Record the specific reason on each failed post's own row, so the UI can
+  // show "why" per post instead of only a campaign-wide count.
+  for (const f of failed) {
+    const { error: failErr } = await admin
+      .from("campaign_posts")
+      .update({ last_scrape_error: f.reason })
+      .eq("campaign_id", campaignId)
+      .eq("post_url", f.url);
+    if (failErr) console.error(`failed to record last_scrape_error for ${f.url}`, failErr);
   }
 
   return { succeeded: rows.length, failed };
