@@ -8,6 +8,11 @@
 // refreshing_since acts as a lock) -- this is the backend-level fix for the
 // double-refresh/double-billing issue found earlier, independent of
 // whatever the frontend's "Refresh now" button does.
+//
+// Body accepts an optional `only_failed: true` to re-scrape just the posts
+// that failed last time (last_scrape_error is set), instead of the whole
+// campaign -- avoids re-paying for posts that already succeeded when only
+// a subset failed.
 
 import { corsHeaders, jsonResponse } from "../_shared/http.ts";
 import { adminClient, requireAdmin } from "../_shared/authorizeAdmin.ts";
@@ -37,6 +42,11 @@ Deno.serve(async (req) => {
     if (!campaignId) {
       return jsonResponse({ error: "campaign_id is required" }, 400);
     }
+    // When true, only re-scrape posts that failed last time (last_scrape_error
+    // is set) instead of every post in the campaign -- avoids re-paying for
+    // Apify scrapes of posts that already succeeded, when only a subset
+    // failed (e.g. Instagram rate-limiting a portion of a large batch).
+    const onlyFailed = body?.only_failed === true;
 
     // Atomic compare-and-swap: acquire the lock in a single UPDATE...WHERE
     // so two simultaneous requests can't both read "unlocked" before either
@@ -70,10 +80,11 @@ Deno.serve(async (req) => {
     }
 
     try {
-      const { data: existingPosts, error: postsErr } = await admin
-        .from("campaign_posts")
-        .select("post_url")
-        .eq("campaign_id", campaignId);
+      let postsQuery = admin.from("campaign_posts").select("post_url").eq("campaign_id", campaignId);
+      if (onlyFailed) {
+        postsQuery = postsQuery.not("last_scrape_error", "is", null);
+      }
+      const { data: existingPosts, error: postsErr } = await postsQuery;
       if (postsErr) throw postsErr;
 
       const postUrls = (existingPosts ?? []).map((p) => p.post_url as string);
@@ -82,7 +93,7 @@ Deno.serve(async (req) => {
         await admin.from("campaigns").update({ refreshing_since: null }).eq("id", campaignId);
         return jsonResponse({
           campaign_id: campaignId,
-          message: "no_posts_to_refresh",
+          message: onlyFailed ? "no_failed_posts_to_retry" : "no_posts_to_refresh",
         });
       }
 
@@ -106,6 +117,7 @@ Deno.serve(async (req) => {
       return jsonResponse({
         campaign_id: campaignId,
         status: "started",
+        mode: onlyFailed ? "failed_only" : "full",
         requested: postUrls.length,
         run_id: runId,
       });
